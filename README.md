@@ -2,9 +2,10 @@
 Official PyTorch implement of paper [EfficientQAT: Efficient Quantization-Aware Training for Large Language Models](https://arxiv.org/abs/2407.11062)
 
 ## News
-- [2025/05] 🔥 **We explore the [Scaling Law for Quantization-Aware Training](https://export.arxiv.org/abs/2505.14302), which offers insights and instruction for LLMs QAT.**
+- [2025/11] 🔥 **We open-source [INT vs. FP](https://github.com/ChenMnZ/INT_vs_FP), a framework to compare low-bit integer and float-point formats, including MXFP8/MXFP6/MXFP4/NVFP4 and MXINT8/MXINT6/MXINT4/NVINT4.**
+- [2025/05] 🔥 We explore the [Scaling Law for Quantization-Aware Training](https://export.arxiv.org/abs/2505.14302), which offers insights and instruction for LLMs QAT.
 - [2025/05] 🌟 Our EfficientQAT paper has been accepted for ACL 2025 Main Conference! 🎉 Cheers!
-- [2024/10] 🔥 We release a new weight-activation quantization algorithm, [PrefixQuant](https://github.com/ChenMnZ/PrefixQuant), which is the first work to let the performance of static activation quantization surpasses dynamic ones.
+- [2024/10] 🔥 We release a new weight-activation quantization algorithm, [PrefixQuant](https://github.com/ChenMnZ/PrefixQuant), which proposed an efficient method to isolate sink token (token-wise outlier).
 - [2024/08] The new inference backend [T-MAC](https://github.com/microsoft/T-MAC) from Microsoft has supported EffcientQAT models.
 - [2024/08] We support for the quantization of [Mistral-Large-Instruct](https://huggingface.co/mistralai/Mistral-Large-Instruct-2407). W2g64 Mistral-Large-Instruct with our EfficientQAT can compress the 123B models to 35 GB with only 4 points accuracy degeneration.
 - [2024/07] New featurs! We support to transfer EfficientQAT quantized models into `GPTQ v2` format and `BitBLAS` format, which can be directly loaded through [GPTQModel](https://github.com/ModelCloud/GPTQModel).
