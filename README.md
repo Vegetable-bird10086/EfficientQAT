@@ -37,6 +37,14 @@ conda activate efficientqat
 pip install -r requirements.txt
 ```
 
+For CUDA environments that need paged AdamW or Triton kernels, install the optional GPU extras as well:
+```
+pip install -r requirements-cuda.txt
+```
+
+- `requirements.txt` is now the portable baseline and supports newer `transformers` / `accelerate` / `torch` releases.
+- `requirements-cuda.txt` keeps the CUDA-specific dependencies optional so the repo can still be used on CPU-only or macOS environments.
+
 ## Model Zoo
 
 We provide a number of prequantized EfficientQAT models as follows: 
@@ -101,6 +109,7 @@ Some other important arguments:
 - `--train_size`: number of training data samples, 4096 as default
 - `--val_size`: number of validation data samples, 64 as default
 - `--off_load_to_disk`: save training dataset to disk, saving CPU memory but may reduce training speed
+- `--quant_config`: optional JSON file for per-layer overrides, mixed precision, or skip rules. When omitted, EfficientQAT keeps the original global `--wbits/--group_size` behavior.
 
 
 2. E2E-QP
@@ -117,6 +126,31 @@ bash examples/e2e_qp/Llama-2-7b/w2g64-redpajama.sh
 bash examples/e2e_qp/Llama-2-7b/w2g128-redpajama.sh
 ```
 Specifically, the `--learning_rate` is `2e-5` for 2-bit and `1e-5` for 3-/4-bits in our experiments. You can decrease the `--per_device_train_batch_size` to reduce the memory footprint during training, and making sure that `--gradient_accumulation_steps`  increases by the same multiple to maintain the same batch size.
+
+Example per-layer quantization config:
+```json
+{
+  "default": {
+    "bits": 2,
+    "group_size": 32,
+    "mapping": "asymmetric",
+    "granularity": "per_group"
+  },
+  "overrides": [
+    {
+      "pattern": "model.embed_tokens",
+      "enabled": false,
+      "bits": 16
+    },
+    {
+      "pattern": "*.self_attn.o_proj",
+      "bits": 8,
+      "granularity": "per_channel",
+      "mapping": "symmetric"
+    }
+  ]
+}
+```
 
 
 
@@ -164,8 +198,17 @@ bash examples/model_transfer/efficientqat_to_gptq/llama-2-7b.sh
 bash examples/model_transfer/efficientqat_to_bitblas/llama-2-7b.sh
 ```
 - Speedup has some problem, refer [this issue](https://github.com/microsoft/BitBLAS/issues/90) for details.
+- The GPTQ and BitBLAS exporters still expect a uniform quantization layout. If you use per-layer overrides, generate TorchAO metadata instead of these formats.
 
-3. Transfer fp32 datas in EfficientQAT checkpoints to half-precision counterparts.
+3. Generate TorchAO / ExecuTorch quantization metadata
+```
+python model_transfer/efficientqat_to_torchao.py \
+  --model ./output/block_ap_models/Llama-2-7b-w2g64 \
+  --save_dir ./output/torchao/Llama-2-7b-w2g64
+```
+- This command emits `torchao_quant_manifest.json` plus the normalized `efficientqat_quant_config.json`, which can be used as the handoff layer for PT2E / ExecuTorch export pipelines.
+
+4. Transfer fp32 datas in EfficientQAT checkpoints to half-precision counterparts.
 Some of parameters are saved as fp32 for training, you can transfer them into half-precision to further reducing model size after training. 
 ```
 bash examples/model_transfer/fp32_to_16/llama-2-7b.sh

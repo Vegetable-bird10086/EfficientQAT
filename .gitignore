@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+cache/
+output/
+log/
+
+GPTQModel/
+gptqmodel-*.whl
+llama3.2-3B-instruct/

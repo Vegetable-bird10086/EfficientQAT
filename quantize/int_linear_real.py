@@ -1,26 +1,35 @@
 import math
 from logging import getLogger
 
-import numpy as np
 import torch
 import torch.nn as nn
 import transformers
-
-from quantize.triton_utils.kernels import dequant_dim0, dequant_dim1
-import math
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_in_model
 from tqdm import tqdm
-import gc  
-from quantize.utils import get_named_linears,set_op_by_name
+
+from hf_compat import build_model_from_config, load_auto_config, load_auto_tokenizer
+from quantize.bitpacking import pack_cols, pack_rows, pad_rows, unpack_cols, unpack_rows, unpad_rows
+from quantize.config import QuantizationSpec, maybe_load_quant_config
+from quantize.quantizer import CLIPMIN, clamp_ste, round_ste
+from quantize.utils import get_named_linears, set_op_by_name
 
 logger = getLogger(__name__)
+
+try:
+    Conv1D = transformers.pytorch_utils.Conv1D
+except Exception:
+    Conv1D = getattr(transformers, "Conv1D", None)
+
+try:
+    from quantize.triton_utils.kernels import dequant_dim0 as triton_dequant_dim0
+except Exception:
+    triton_dequant_dim0 = None
 
 
 class TritonModuleMixin:
     @classmethod
-    def warmup(cls, model, transpose=False, seqlen=2048):
-        pass
+    def warmup(cls, model, transpose: bool = False, seqlen: int = 2048):
+        return None
 
 
 class QuantLinear(nn.Module, TritonModuleMixin):
@@ -34,167 +43,221 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         outfeatures,
         bias,
         trainable=False,
-        **kwargs
+        mapping="asymmetric",
+        train_scale=True,
+        train_zero_point=True,
+        quant_spec: QuantizationSpec | None = None,
+        **kwargs,
     ):
         super().__init__()
-        # if bits not in [2, 4, 8]:
-        #     raise NotImplementedError("Only 2,4,8 bits are supported.")
-        # if infeatures % 32 != 0 or outfeatures % 32 != 0:
-        #     raise NotImplementedError("in_feature and out_feature must be divisible by 32.")
         self.infeatures = infeatures
         self.outfeatures = outfeatures
         self.bits = bits
         self.group_size = group_size if group_size != -1 else infeatures
         self.maxq = 2 ** self.bits - 1
+        self.quant_spec = quant_spec or QuantizationSpec(
+            bits=bits,
+            group_size=group_size,
+            mapping=mapping,
+            train_scale=train_scale,
+            train_zero_point=train_zero_point,
+        )
+        self.mapping = self.quant_spec.mapping
+        self.trainable = trainable
+        self.use_fake = False
+        self.fake_transpose = False
+
+        rows_per_int = 32 // self.bits
+        num_groups = math.ceil(infeatures / self.group_size)
+
         self.register_buffer(
-            'qweight',
-            torch.zeros((math.ceil(infeatures / (32 // self.bits)), outfeatures), dtype=torch.int32)
+            "qweight",
+            torch.zeros((math.ceil(infeatures / rows_per_int), outfeatures), dtype=torch.int32),
         )
         self.register_parameter(
-            'scales',
-            torch.nn.Parameter(torch.zeros((math.ceil(infeatures / self.group_size), outfeatures), dtype=torch.float16))
+            "scales",
+            nn.Parameter(torch.ones((num_groups, outfeatures), dtype=torch.float16), requires_grad=train_scale),
+        )
+        self.register_parameter(
+            "zero_points",
+            nn.Parameter(torch.zeros((num_groups, outfeatures), dtype=torch.float32), requires_grad=train_zero_point),
         )
         self.register_buffer(
-            'qzeros',
-            torch.zeros((math.ceil(infeatures / self.group_size), math.ceil(outfeatures / (32 // self.bits))), dtype=torch.int32)
+            "qzeros",
+            torch.zeros((num_groups, math.ceil(outfeatures / rows_per_int)), dtype=torch.int32),
         )
         self.register_buffer(
-            'g_idx',
-            torch.tensor([i // self.group_size for i in range(infeatures)], dtype=torch.int32)
-        )   # not used, just for consistent with GPTQ models
+            "g_idx",
+            torch.tensor([i // self.group_size for i in range(infeatures)], dtype=torch.int32),
+        )
         if bias:
-            self.register_buffer('bias', torch.zeros((outfeatures), dtype=torch.float16))
+            self.register_buffer("bias", torch.zeros((outfeatures), dtype=torch.float16))
         else:
             self.bias = None
 
-        self.zeros_dim0, self.zeros_dim1 = self.scales.shape
-        self.trainable = trainable
-        self.scales.requires_grad = True
-        self.use_fake = False
-
     def post_init(self):
-        pass
+        return None
 
+    def _rounded_zero_points(self) -> torch.Tensor:
+        return clamp_ste(round_ste(self.zero_points), 0, self.maxq)
 
-    def use_fake_quantization(self, del_quant=False,transpose=False):
-        # use fake quantization for faster training but consume more memory
-        weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
-        dim0, dim1 = weight.shape
-        zeros = dequant_dim1(self.qzeros, self.bits, self.maxq, self.zeros_dim0, self.zeros_dim1)
-        weight = ((weight.view(-1, self.group_size, dim1) - zeros.view(-1, 1, dim1)) * self.scales.view(-1, 1, dim1)).reshape(dim0, dim1)
+    def _dequantize_qweight(self) -> torch.Tensor:
+        if triton_dequant_dim0 is not None and self.qweight.is_cuda:
+            return triton_dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
+        return unpack_rows(self.qweight, self.bits, self.infeatures, self.outfeatures).to(self.qweight.device)
+
+    def _pack_zero_points(self, zero_points: torch.Tensor) -> torch.Tensor:
+        return pack_cols(zero_points.clamp(0, self.maxq).round().to(torch.int64), self.bits)
+
+    def use_fake_quantization(self, del_quant: bool = False, transpose: bool = False):
+        weight = self._dequantized_weight()
         if transpose:
             self.fake_transpose = True
-            weight = weight.transpose(0,1).contiguous()
-        self.register_buffer(
-            'weight',
-            weight
-        )
+            weight = weight.transpose(0, 1).contiguous()
+        self.register_buffer("weight", weight)
         self.use_fake = True
         if del_quant:
             del self.qweight
             del self.scales
+            del self.zero_points
             del self.qzeros
             del self.g_idx
-        
-    def pack(self, linear, scales, zeros, g_idx=None):
-        W = linear.weight.data.clone()
-        if isinstance(linear, nn.Conv2d):
-            W = W.flatten(1)
-        if isinstance(linear, transformers.pytorch_utils.Conv1D):
-            W = W.t()
-    
-        g_idx = torch.tensor([i // self.group_size for i in range(self.infeatures)], dtype=torch.int32)
 
-        scale_zeros = zeros * scales
-        self.scales = nn.Parameter(scales.half())
+    def _dequantized_weight(self) -> torch.Tensor:
+        weight = self._dequantize_qweight()
+        padded_weight, padded_rows = pad_rows(weight, self.group_size)
+        scales = clamp_ste(self.scales, CLIPMIN, 1e4).to(weight.dtype)
+        zeros = self._rounded_zero_points().to(weight.dtype)
+        dequant = (
+            (padded_weight.view(-1, self.group_size, self.outfeatures) - zeros.view(-1, 1, self.outfeatures))
+            * scales.view(-1, 1, self.outfeatures)
+        ).reshape(padded_weight.shape[0], self.outfeatures)
+        return unpad_rows(dequant, padded_rows)
+
+    def pack(self, linear, scales, zeros, g_idx=None):
+        weight = linear.weight.data.clone()
+        if isinstance(linear, nn.Conv2d):
+            weight = weight.flatten(1)
+        if Conv1D is not None and isinstance(linear, Conv1D):
+            weight = weight.t()
+
+        g_idx = torch.tensor([i // self.group_size for i in range(self.infeatures)], dtype=torch.long)
+
+        scales = scales.to(torch.float16)
+        zeros = zeros.to(torch.float32)
+        self.scales = nn.Parameter(scales, requires_grad=self.quant_spec.train_scale)
+        self.zero_points = nn.Parameter(zeros, requires_grad=self.quant_spec.train_zero_point)
+        self.qzeros = self._pack_zero_points(zeros).to(torch.int32)
         if linear.bias is not None:
             self.bias = linear.bias.clone().half()
 
-        intweight = []
-        for idx in range(self.infeatures):
-            intweight.append(
-                torch.round(
-                    (
-                        W[:, idx] + scale_zeros[g_idx[idx]]) / self.scales[g_idx[idx]]
-                ).to(torch.int)[:, None]
-            )
-        intweight = torch.cat(intweight, dim=1)
-        intweight = intweight.t().contiguous()
-        intweight = intweight.numpy().astype(np.uint32)
+        transposed = weight.t().contiguous().to(torch.float32)
+        expanded_scales = scales[g_idx].to(torch.float32)
+        expanded_zeros = zeros[g_idx]
+        intweight = torch.round(transposed / expanded_scales + expanded_zeros).clamp(0, self.maxq)
+        self.qweight = pack_rows(intweight.to(torch.int64), self.bits).to(torch.int32)
 
-        i = 0
-        row = 0
-        qweight = np.zeros((math.ceil(intweight.shape[0]/(32//self.bits)), intweight.shape[1]), dtype=np.uint32)
-        while row < qweight.shape[0]:
-            if self.bits in [2, 3, 4, 8]:
-                for j in range(i, min(i + (32 // self.bits), intweight.shape[0])):
-                    qweight[row] |= intweight[j] << (self.bits * (j - i))
-                i += 32 // self.bits
-                row += 1
-            else:
-                raise NotImplementedError("Only 2,3,4,8 bits are supported.")
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        self.qzeros = self._pack_zero_points(self.zero_points.detach()).to(self.qzeros.device)
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        destination.pop(prefix + "zero_points", None)
+        destination[prefix + "qzeros"] = self.qzeros if keep_vars else self.qzeros.detach()
 
-        qweight = qweight.astype(np.int32)
-        self.qweight = torch.from_numpy(qweight)
-
-        zeros = zeros.numpy().astype(np.uint32)
-        self.zeros_dim0, self.zeros_dim1 = zeros.shape
-        qzeros = np.zeros((zeros.shape[0], math.ceil(zeros.shape[1] / (32 // self.bits))), dtype=np.uint32)
-        i = 0
-        col = 0
-        while col < qzeros.shape[1]:
-            if self.bits in [2, 3, 4, 8]:
-                for j in range(i, min(i + (32 // self.bits), zeros.shape[1])):
-                    qzeros[:, col] |= zeros[:, j] << (self.bits * (j - i))
-                i += 32 // self.bits
-                col += 1
-            else:
-                raise NotImplementedError("Only 2,3,4,8 bits are supported.")
-                
-        qzeros = qzeros.astype(np.int32)
-        self.qzeros = torch.from_numpy(qzeros)
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        zero_key = prefix + "zero_points"
+        qzero_key = prefix + "qzeros"
+        if zero_key not in state_dict and qzero_key in state_dict:
+            unpacked = unpack_cols(state_dict[qzero_key], self.bits, math.ceil(self.infeatures / self.group_size), self.outfeatures)
+            state_dict[zero_key] = unpacked.to(self.zero_points.dtype)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x):
         if self.use_fake:
             weight = self.weight
             if self.fake_transpose:
-                weight = weight.transpose(0,1)
+                weight = weight.transpose(0, 1)
         else:
-            weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
-            dim0, dim1 = weight.shape
-            # dim2 = (dim1*dim0)//self.group_size
-            zeros = dequant_dim1(self.qzeros, self.bits, self.maxq, self.zeros_dim0, self.zeros_dim1)
-            weight = ((weight.view(-1, self.group_size, dim1) - zeros.view(-1, 1, dim1)) * self.scales.view(-1, 1, dim1)).reshape(dim0, dim1)
-        # out = torch.matmul(x, weight)
+            weight = self._dequantized_weight()
         out = torch.matmul(x, weight.to(x.dtype))
-        out = out + self.bias if self.bias is not None else out
+        if self.bias is not None:
+            out = out + self.bias
         return out
 
 
-def load_quantized_model(model_path, wbits, group_size):
+def load_quantized_model(
+    model_path,
+    wbits,
+    group_size,
+    quant_config_path=None,
+    trust_remote_code=False,
+    token=None,
+):
     print(f"Loading quantized model from {model_path}")
 
-    # import pdb;pdb.set_trace()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-    config = AutoConfig.from_pretrained(model_path)
+    tokenizer = load_auto_tokenizer(
+        model_path,
+        use_fast=False,
+        trust_remote_code=trust_remote_code,
+        token=token,
+    )
+    config = load_auto_config(model_path, trust_remote_code=trust_remote_code, token=token)
+    quant_config = maybe_load_quant_config(model_path, default_bits=wbits, default_group_size=group_size)
+    if quant_config_path is not None:
+        quant_config = maybe_load_quant_config(quant_config_path, default_bits=wbits, default_group_size=group_size)
+
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(config=config,torch_dtype=torch.float16, trust_remote_code=True)
+        model = build_model_from_config(
+            config=config,
+            torch_dtype=torch.float16,
+            trust_remote_code=trust_remote_code,
+        )
+
     layers = model.model.layers
-    for i in tqdm(range(len(layers))):
-        layer = layers[i]
+    for index in tqdm(range(len(layers))):
+        layer = layers[index]
         named_linears = get_named_linears(layer, torch.nn.Linear)
         for name, module in named_linears.items():
-            q_linear = QuantLinear(wbits, group_size, module.in_features,module.out_features,not module.bias is None)
+            spec = quant_config.resolve(name, module.in_features)
+            if not spec.should_quantize:
+                continue
+            q_linear = QuantLinear(
+                spec.bits,
+                spec.resolved_group_size(module.in_features),
+                module.in_features,
+                module.out_features,
+                not module.bias is None,
+                mapping=spec.mapping,
+                train_scale=spec.train_scale,
+                train_zero_point=spec.train_zero_point,
+                quant_spec=spec,
+            )
             q_linear.to(next(layer.parameters()).device)
             set_op_by_name(layer, name, q_linear)
-    torch.cuda.empty_cache()
-    gc.collect()
+
     model.tie_weights()
     device_map = infer_auto_device_map(model)
     print("Loading pre-computed quantized weights...")
-    load_checkpoint_in_model(model,checkpoint=model_path,device_map=device_map,offload_state_dict=True)
+    load_checkpoint_in_model(model, checkpoint=model_path, device_map=device_map, offload_state_dict=True)
     print("Loading pre-computed quantized weights Successfully")
 
     return model, tokenizer
 
-__all__ = ["QuantLinear","load_omniq_quantized"]
+
+__all__ = ["QuantLinear", "load_quantized_model"]

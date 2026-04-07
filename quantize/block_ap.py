@@ -13,6 +13,7 @@ from quantize.utils import (
     quant_parameters,weight_parameters,trainable_parameters,
     set_quant_state,quant_inplace,set_quant_parameters,
     set_weight_parameters,trainable_parameters_num,get_named_linears,set_op_by_name)
+from quantize.config import EfficientQATQuantConfig, QuantizationSpec
 import time
 from datautils_block import BlockTrainDataset
 from torch.utils.data import DataLoader
@@ -36,6 +37,7 @@ def block_ap(
     trainloader,
     valloader,
     logger=None,
+    quant_config: EfficientQATQuantConfig | None = None,
 ):
     logger.info("Starting ...")
     if args.off_load_to_disk:
@@ -165,8 +167,11 @@ def block_ap(
         qlayer = copy.deepcopy(layer)
         for name, module in qlayer.named_modules():
             if isinstance(module,torch.nn.Linear):
-                quantlinear = int_linear_fake.QuantLinear(module, args.wbits, args.group_size)
-                set_op_by_name(qlayer, name, quantlinear)  
+                spec = quant_config.resolve(name, module.in_features) if quant_config is not None else QuantizationSpec(bits=args.wbits, group_size=args.group_size)
+                if not spec.should_quantize:
+                    continue
+                quantlinear = int_linear_fake.QuantLinear(module, args.wbits, args.group_size, quant_spec=spec)
+                set_op_by_name(qlayer, name, quantlinear)
                 del module  
         qlayer.to(dev)
         
@@ -290,7 +295,17 @@ def block_ap(
                 dim0 = module.weight.shape[0]
                 scales = scales.view(dim0,-1).transpose(0,1).contiguous()
                 zeros = zeros.view(dim0,-1).transpose(0,1).contiguous()
-                q_linear = int_linear_real.QuantLinear(args.wbits, group_size, module.in_features,module.out_features,not module.bias is None)
+                q_linear = int_linear_real.QuantLinear(
+                    module.quant_spec.bits,
+                    group_size,
+                    module.in_features,
+                    module.out_features,
+                    not module.bias is None,
+                    mapping=module.quant_spec.mapping,
+                    train_scale=module.quant_spec.train_scale,
+                    train_zero_point=module.quant_spec.train_zero_point,
+                    quant_spec=module.quant_spec,
+                )
                 q_linear.pack(module.cpu(),  scales.float().cpu(), zeros.float().cpu())
                 set_op_by_name(qlayer, name, q_linear)       
                 logger.info(f"pack quantized {name} finished")
@@ -308,4 +323,3 @@ def block_ap(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model
-

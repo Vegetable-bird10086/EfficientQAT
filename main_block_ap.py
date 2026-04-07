@@ -10,8 +10,9 @@ from quantize.block_ap import block_ap
 from tqdm import tqdm
 import utils
 from pathlib import Path
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from hf_compat import load_auto_config, load_auto_model_for_causal_lm, load_auto_tokenizer, resolve_hf_token
 from quantize.int_linear_real import load_quantized_model
+from quantize.config import load_quant_config
 from accelerate import infer_auto_device_map, dispatch_model
 
 
@@ -85,6 +86,9 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--wbits", type=int, default=4, help="weights quantization bits")
     parser.add_argument("--group_size", type=int, default=128, help="weights quantization group size")
+    parser.add_argument("--quant_config", type=str, default=None, help="path to a JSON quantization config with per-layer overrides")
+    parser.add_argument("--trust_remote_code", action="store_true", help="enable trust_remote_code for custom model repositories")
+    parser.add_argument("--token", type=str, default=None, help="HF token for gated/private models")
     parser.add_argument("--quant_lr", type=float, default=1e-4, help="lr of quantization parameters (s and z)")
     parser.add_argument("--weight_lr", type=float, default=1e-5, help="lr of full-precision weights")
     parser.add_argument("--min_lr_factor", type=float, default=20, help="min_lr = lr/min_lr_factor")
@@ -113,19 +117,42 @@ def main():
     output_dir = Path(args.output_dir)
     logger = utils.create_logger(output_dir)
     logger.info(args)
+    quant_config = load_quant_config(args.quant_config, default_bits=args.wbits, default_group_size=args.group_size)
+    logger.info(f"quantization config: {quant_config.to_dict()}")
+    hf_token = resolve_hf_token(token=args.token)
     
     if args.net is None:
         args.net = args.model.split('/')[-1]
         logger.info(f"net is None, setting as {args.net}")
     if args.resume_quant:
         # directly load quantized model for evaluation
-        model, tokenizer = load_quantized_model(args.resume_quant,args.wbits, args.group_size)
+        model, tokenizer = load_quantized_model(
+            args.resume_quant,
+            args.wbits,
+            args.group_size,
+            quant_config_path=args.quant_config,
+            trust_remote_code=args.trust_remote_code,
+            token=hf_token,
+        )
         logger.info(f"memory footprint after loading quantized model: {torch.cuda.max_memory_allocated('cuda') / 1024**3:.2f}GiB")
     else:
         # load fp quantized model
-        config = AutoConfig.from_pretrained(args.model)
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False,legacy=False)
-        model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
+        config = load_auto_config(args.model, trust_remote_code=args.trust_remote_code, token=hf_token)
+        tokenizer = load_auto_tokenizer(
+            args.model,
+            use_fast=False,
+            legacy=False,
+            trust_remote_code=args.trust_remote_code,
+            token=hf_token,
+        )
+        model = load_auto_model_for_causal_lm(
+            args.model,
+            config=config,
+            device_map='cpu',
+            torch_dtype=torch.float16,
+            trust_remote_code=args.trust_remote_code,
+            token=hf_token,
+        )
         for param in model.parameters():
             param.requires_grad = False
 
@@ -158,6 +185,7 @@ def main():
                 trainloader,
                 valloader,
                 logger,
+                quant_config=quant_config,
             )
             logger.info(time.time() - tick)
     torch.cuda.empty_cache()
@@ -165,6 +193,7 @@ def main():
         logger.info("start saving model")
         model.save_pretrained(args.save_quant_dir)  
         tokenizer.save_pretrained(args.save_quant_dir) 
+        quant_config.save(args.save_quant_dir)
         logger.info("save model success")
     evaluate(model, tokenizer, args,logger)
 

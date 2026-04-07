@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict
 import numpy as np
 import importlib
+import warnings
 from packaging import version
 
 import torch
@@ -14,17 +15,24 @@ import argparse
 from transformers import (
     set_seed,
     Seq2SeqTrainer,
-    LlamaTokenizer
 )
 
 
 from datautils_block import test_ppl
 from datautils_e2e import make_data_module
-from bitsandbytes.optim import AdamW
 import os
 import utils
+from hf_compat import tokenizer_is_llama_like
+from hf_compat import resolve_hf_token
 from quantize.int_linear_real import load_quantized_model,QuantLinear
+from quantize.utils import is_quant_parameter_name
+from quantize.config import maybe_load_quant_config
 from pathlib import Path
+
+try:
+    from bitsandbytes.optim import AdamW as BnbAdamW
+except Exception:
+    BnbAdamW = None
 
 
 
@@ -50,6 +58,17 @@ def is_ipex_available():
         )
         return False
     return True
+
+
+def build_optimizer(parameters, requested_optim: str):
+    requested = (requested_optim or "").lower()
+    if "adamw" not in requested:
+        warnings.warn(f"Unsupported optimizer '{requested_optim}', falling back to AdamW.")
+    if "paged" in requested and BnbAdamW is None:
+        warnings.warn("bitsandbytes is not installed; falling back to torch.optim.AdamW.")
+    if "paged" in requested and BnbAdamW is not None:
+        return BnbAdamW(parameters)
+    return torch.optim.AdamW(parameters)
     
 
 if torch.cuda.is_available():   
@@ -76,6 +95,14 @@ class ModelArguments:
     use_auth_token: Optional[bool] = field(
         default=False,
         metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
+    )
+    token: Optional[str] = field(
+        default=None,
+        metadata={"help": "HF token for gated/private model repositories."}
+    )
+    quant_config: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional JSON quantization config with per-layer overrides."}
     )
 
 @dataclass
@@ -189,9 +216,15 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
     logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
     group_by_length: bool = field(default=False, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
+    evaluation_strategy: Optional[str] = field(default=None, metadata={"help": "Backward-compatible alias for eval_strategy."})
     save_strategy: str = field(default='epoch', metadata={"help": 'When to save checkpoints'})
     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=5, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+
+    def __post_init__(self):
+        if self.evaluation_strategy is not None and hasattr(self, "eval_strategy"):
+            object.__setattr__(self, "eval_strategy", self.evaluation_strategy)
+        super().__post_init__()
 
 @dataclass
 class GenerationArguments:
@@ -246,7 +279,15 @@ def get_accelerate_model(args, checkpoint_dir):
 
 
     
-    model, tokenizer = load_quantized_model(args.quant_model_path,args.wbits, args.group_size)
+    hf_token = resolve_hf_token(token=args.token, use_auth_token=args.use_auth_token)
+    model, tokenizer = load_quantized_model(
+        args.quant_model_path,
+        args.wbits,
+        args.group_size,
+        quant_config_path=args.quant_config,
+        trust_remote_code=args.trust_remote_code,
+        token=hf_token,
+    )
     tokenizer.model_max_length = args.pt_context_len
     
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))        
@@ -263,7 +304,7 @@ def get_accelerate_model(args, checkpoint_dir):
     model.cuda()
     model.train()
         
-    if tokenizer._pad_token is None:
+    if tokenizer.pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
             tokenizer=tokenizer,
@@ -272,7 +313,7 @@ def get_accelerate_model(args, checkpoint_dir):
 
     # TODO
     # if 'llama1' in args.model_name_or_path or 'llama2' in args.model_name_or_path or 'llama-1' in args.model_name_or_path or 'llama-2' in args.model_name_or_path:
-    if isinstance(tokenizer, LlamaTokenizer):
+    if tokenizer_is_llama_like(tokenizer):
         # LLaMA tokenizer may not have correct special tokens set.
         # Check and add them if missing to prevent them from being parsed into different tokens.
         # Note that these are present in the vocabulary.
@@ -396,6 +437,7 @@ def train():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     logger = utils.create_logger(args.output_dir)
     logger.info(args)
+    maybe_load_quant_config(args.quant_config or args.quant_model_path, default_bits=args.wbits, default_group_size=args.group_size).save(args.output_dir)
     
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
@@ -416,8 +458,15 @@ def train():
         # if isinstance(module, LoraLayer):
         if isinstance(module, QuantLinear) and not 'head' in name:
             module.scales.requires_grad = True
-    optimizer_grouped_parameters.append({'params': [p for n, p in model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': args.learning_rate})
-    optimizer = AdamW(optimizer_grouped_parameters)
+            module.zero_points.requires_grad = module.quant_spec.train_zero_point
+    optimizer_grouped_parameters.append(
+        {
+            'params': [p for n, p in model.named_parameters() if is_quant_parameter_name(n) and p.requires_grad],
+            'weight_decay': 0.0,
+            'lr': args.learning_rate,
+        }
+    )
+    optimizer = build_optimizer(optimizer_grouped_parameters, args.optim)
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -456,7 +505,7 @@ def train():
     print(args.output_dir)
     if args.do_train:
         logger.info("*** Train ***")
-        train_result = trainer.train(args.resume_from_checkpoint)
+        train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
         metrics = train_result.metrics
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)

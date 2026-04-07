@@ -5,6 +5,10 @@ from torch import nn
 from typing  import Optional
 
 
+def is_quant_parameter_name(name: str) -> bool:
+    return any(token in name for token in ("scale", "scales", "zero_point", "zero_points"))
+
+
 class MultiBlock(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -25,28 +29,28 @@ class MultiBlock(nn.Module):
 def set_weight_parameters(model, requires_grad):
     params = []
     for n, m in model.named_parameters():
-        if n.find('weight') > -1 and not (n.find('scale') > -1 or n.find('zero_point') > -1):
+        if n.find('weight') > -1 and not is_quant_parameter_name(n):
             m.requires_grad = requires_grad
     return iter(params)
 
 def weight_parameters(model):
     params = []
     for n, m in model.named_parameters():
-        if n.find('weight') > -1 and not (n.find('scale') > -1 or n.find('zero_point') > -1):
+        if n.find('weight') > -1 and not is_quant_parameter_name(n):
             params.append(m)
     return iter(params)
 
 def set_quant_parameters(model, requires_grad):
     params = []
     for n, m in model.named_parameters():
-        if n.find('scale') > -1 or n.find('zero_point') > -1:
+        if is_quant_parameter_name(n):
             m.requires_grad = requires_grad
     return iter(params)  
 
 def quant_parameters(model):
     params = []
     for n, m in model.named_parameters():
-        if n.find('scale') > -1 or n.find('zero_point') > -1:
+        if is_quant_parameter_name(n):
             params.append(m)
     return iter(params)  
 

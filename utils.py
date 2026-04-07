@@ -1,10 +1,15 @@
 import torch
 from math import inf
 import logging
-from termcolor import colored
 import sys
 import os
 import time
+
+try:
+    from termcolor import colored
+except Exception:
+    def colored(text, *args, **kwargs):
+        return text
 
 
 def ampscaler_get_grad_norm(parameters, norm_type: float = 2.0) -> torch.Tensor:

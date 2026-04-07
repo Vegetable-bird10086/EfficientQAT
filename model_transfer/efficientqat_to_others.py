@@ -1,9 +1,10 @@
 import torch
 from datautils_block import test_ppl
-from transformers import AutoTokenizer
 from gptqmodel import GPTQModel, QuantizeConfig, get_backend
 from pathlib import Path
 import time
+from hf_compat import load_auto_tokenizer, resolve_hf_token
+from quantize.config import maybe_load_quant_config, is_uniform_quant_config
 
 def main():
     import argparse
@@ -13,6 +14,9 @@ def main():
     parser.add_argument("--wbits", type=int, default=4, help="quantization bits")
     parser.add_argument("--group_size", type=int, default=128, help="quantization group size")
     parser.add_argument("--target_format", default='gptq', type=str, help="target checkpoint format")
+    parser.add_argument("--quant_config", default=None, type=str, help="optional JSON quantization config; defaults to the metadata in --model")
+    parser.add_argument("--trust_remote_code", action="store_true", help="enable trust_remote_code when loading tokenizer/model")
+    parser.add_argument("--token", default=None, type=str, help="HF token for gated/private models")
     parser.add_argument("--eval_ppl", action="store_true")
     parser.add_argument("--test_speed", action="store_true")
     parser.add_argument("--save_dir", default=None, type=str, help="direction for saving quantization model")
@@ -21,7 +25,20 @@ def main():
 
 
     args = parser.parse_args()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False,legacy=False)
+    hf_token = resolve_hf_token(token=args.token)
+    quant_config = maybe_load_quant_config(args.quant_config or args.model, default_bits=args.wbits, default_group_size=args.group_size)
+    if not is_uniform_quant_config(quant_config):
+        raise NotImplementedError(
+            "GPTQ/BitBLAS export currently expects a uniform quantization config. "
+            "Per-layer overrides should use the TorchAO/ExecuTorch metadata path instead."
+        )
+    tokenizer = load_auto_tokenizer(
+        args.model,
+        use_fast=False,
+        legacy=False,
+        trust_remote_code=args.trust_remote_code,
+        token=hf_token,
+    )
     quant_config = QuantizeConfig(
     bits=args.wbits,  
     group_size=args.group_size,
@@ -32,15 +49,38 @@ def main():
     if args.target_format == 'gptq':
         # EXLLAMA_V2 is faster in 4-bit, and can inference correctly. However, it has some bug in saving models.
         # Therefore, we choose triton backend as default. Note that the saving model can also be loaded by exllama too.
-        model = GPTQModel.from_quantized(args.model, device_map='auto',torch_dtype=torch.float16, quantize_config=quant_config,backend=get_backend('TRITON'))
+        model = GPTQModel.from_quantized(
+            args.model,
+            device_map='auto',
+            torch_dtype=torch.float16,
+            quantize_config=quant_config,
+            backend=get_backend('TRITON'),
+            trust_remote_code=args.trust_remote_code,
+            use_auth_token=hf_token,
+        )
 
     elif args.target_format == 'bitblas':
         # take a lone time for the first time runing
         try:
-            model = GPTQModel.from_quantized(args.model, device_map='auto',torch_dtype=torch.float16, quantize_config=quant_config,backend=get_backend('BITBLAS'))
+            model = GPTQModel.from_quantized(
+                args.model,
+                device_map='auto',
+                torch_dtype=torch.float16,
+                quantize_config=quant_config,
+                backend=get_backend('BITBLAS'),
+                trust_remote_code=args.trust_remote_code,
+                use_auth_token=hf_token,
+            )
             args.eval_ppl = False # BitBLAS have bug, which should re-load model for evaluation otherwise would cause wrong outputs
         except:
-            model = GPTQModel.from_quantized(args.model, device_map='auto',torch_dtype=torch.float16, backend=get_backend('BITBLAS'))
+            model = GPTQModel.from_quantized(
+                args.model,
+                device_map='auto',
+                torch_dtype=torch.float16,
+                backend=get_backend('BITBLAS'),
+                trust_remote_code=args.trust_remote_code,
+                use_auth_token=hf_token,
+            )
     else:
         raise NotImplementedError
 
@@ -50,6 +90,7 @@ def main():
         model.quantize_config.model_file_base_name=None # trick to avoid one saving bug in GPTQModel
         model.save_quantized(args.save_dir,max_shard_size='8GB')  
         tokenizer.save_pretrained(args.save_dir) 
+        quant_config.save(args.save_dir)
         print(f"save model to {args.save_dir} success")
 
     model.model.cuda()
