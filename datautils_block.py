@@ -12,33 +12,40 @@ import os
 
 def get_wikitext2(tokenizer, train_size, val_size, seed, seqlen, test_only):
     print("get_wikitext2")
+
     traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
     testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
 
-    testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+    # 拼接
+    train_text = "\n\n".join(traindata['text'])
+    test_text = "\n\n".join(testdata['text'])
+
+    trainenc = tokenizer(train_text, return_tensors='pt')
+    testenc = tokenizer(test_text, return_tensors='pt')
+
     if test_only:
         return testenc
-    trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
 
-    
     random.seed(seed)
+
     trainloader = []
-    val_sample_ratio = 0.9  # sample train from [0:0.9] and val from [0.9:1.0] to avoid overlap
-    for _ in range(train_size):
-        i = random.randint(0, int(trainenc.input_ids.shape[1]*val_sample_ratio) - seqlen - 1)
+    for _ in tqdm(range(train_size)):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
         j = i + seqlen
         inp = trainenc.input_ids[:, i:j]
         tar = inp.clone()
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
+
     valloader = []
-    for _ in range(val_size):
-        i = random.randint(int(trainenc.input_ids.shape[1]*val_sample_ratio) - seqlen - 1, trainenc.input_ids.shape[1] - seqlen - 1)
+    for _ in tqdm(range(val_size)):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
         j = i + seqlen
         inp = trainenc.input_ids[:, i:j]
         tar = inp.clone()
         tar[:, :-1] = -100
         valloader.append((inp, tar))
+
     return trainloader, valloader
 
 
@@ -120,7 +127,7 @@ def get_redpajama(tokenizer, train_size, val_size, seed, seqlen):
         loacal_dataset = "/cpfs01/user/chenmengzhao/huggingface/datasets/togethercomputer___red_pajama-data-1_t-sample"
         traindata = load_dataset(loacal_dataset,split='train')   
     except:
-        traindata = load_dataset("togethercomputer/RedPajama-Data-1T-Sample",split='train')   
+        traindata = load_dataset("togethercomputer/RedPajama-Data-1T",split='train')   
     random.seed(seed)
     traindata = traindata.shuffle(seed=seed) 
     trainloader = []

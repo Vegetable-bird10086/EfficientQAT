@@ -98,6 +98,25 @@ def main():
     parser.add_argument("--max_memory", type=str, default="70GiB",help="The maximum memory of each GPU")
     parser.add_argument("--early_stop", type=int, default=0,help="early stoping after validation loss do not decrease")
     parser.add_argument("--off_load_to_disk", action="store_true", default=False, help="save training dataset to disk, saving CPU memory but may reduce training speed")
+    parser.add_argument(
+        "--log_grad_sensitivity",
+        action="store_true",
+        default=False,
+        help="record per-module gradient magnitudes during Block-AP and rank modules by sensitivity",
+    )
+    parser.add_argument(
+        "--grad_sensitivity_topk",
+        type=int,
+        default=20,
+        help="how many modules to print in the gradient sensitivity summary",
+    )
+    parser.add_argument(
+        "--grad_sensitivity_sort_by",
+        type=str,
+        default="avg_mean_abs_grad",
+        choices=["avg_mean_abs_grad", "avg_l2_norm", "max_abs_grad"],
+        help="metric used to rank gradient sensitivity results",
+    )
 
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     args = parser.parse_args()
@@ -122,7 +141,8 @@ def main():
     hf_token = resolve_hf_token(token=args.token)
     
     if args.net is None:
-        args.net = args.model.split('/')[-1]
+        model_ref = args.model if args.model is not None else args.resume_quant
+        args.net = Path(model_ref).name
         logger.info(f"net is None, setting as {args.net}")
     if args.resume_quant:
         # directly load quantized model for evaluation

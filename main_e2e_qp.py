@@ -84,6 +84,10 @@ class ModelArguments:
         default="",
         metadata={"help": "path of the quantization model by Block-AP."}
     )
+    base_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional original full-precision model path used to speed up quantized checkpoint loading."}
+    )
     model_family: Optional[str] = field(
         default="llama-2",
         metadata={"help": "for the saving of dataset cache for faster experiments"}
@@ -205,7 +209,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
     per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
     gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=0, metadata={"help": 'How many optimizer update steps to take'})
+    max_steps: int = field(default=-1, metadata={"help": 'How many optimizer update steps to take'})
     weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
     learning_rate: float = field(default=2e-5, metadata={"help": 'The learnign rate'})
     remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
@@ -285,6 +289,7 @@ def get_accelerate_model(args, checkpoint_dir):
         args.wbits,
         args.group_size,
         quant_config_path=args.quant_config,
+        base_model_path=args.base_model_path,
         trust_remote_code=args.trust_remote_code,
         token=hf_token,
     )
@@ -305,27 +310,20 @@ def get_accelerate_model(args, checkpoint_dir):
     model.train()
         
     if tokenizer.pad_token is None:
-        smart_tokenizer_and_embedding_resize(
-            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-            tokenizer=tokenizer,
-            model=model,
-        )    
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.bos_token is not None:
+            tokenizer.pad_token = tokenizer.bos_token
+        else:
+            raise ValueError("Tokenizer has no existing eos/bos token to reuse as pad_token.")
 
-    # TODO
-    # if 'llama1' in args.model_name_or_path or 'llama2' in args.model_name_or_path or 'llama-1' in args.model_name_or_path or 'llama-2' in args.model_name_or_path:
-    if tokenizer_is_llama_like(tokenizer):
-        # LLaMA tokenizer may not have correct special tokens set.
-        # Check and add them if missing to prevent them from being parsed into different tokens.
-        # Note that these are present in the vocabulary.
-        # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
-        print('Adding special tokens.')
-        tokenizer.add_special_tokens({
-                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
-                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(
-                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
-                ),
-        })
+    model.config.pad_token_id = tokenizer.pad_token_id
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        if tokenizer.eos_token_id is not None:
+            model.generation_config.eos_token_id = tokenizer.eos_token_id
+        if tokenizer.bos_token_id is not None:
+            model.generation_config.bos_token_id = tokenizer.bos_token_id
 
 
     for name, param in model.named_parameters():

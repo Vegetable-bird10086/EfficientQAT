@@ -13,6 +13,8 @@ Official PyTorch implement of paper [EfficientQAT: Efficient Quantization-Aware 
 
 ## Contents
 - [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Common Workflows](#common-workflows)
 - [Model Zoo](#model-zoo)
 - [Training](#training)
 - [Inference](#Inference)
@@ -44,6 +46,240 @@ pip install -r requirements-cuda.txt
 
 - `requirements.txt` is now the portable baseline and supports newer `transformers` / `accelerate` / `torch` releases.
 - `requirements-cuda.txt` keeps the CUDA-specific dependencies optional so the repo can still be used on CPU-only or macOS environments.
+
+## Quick Start
+
+This repo is easiest to use through three entry points:
+
+- `main_block_ap.py`
+  Block-wise quantization-aware training (Block-AP). This is the main script for producing an EfficientQAT checkpoint from a full-precision model.
+- `main_e2e_qp.py`
+  End-to-end fine-tuning of quantization parameters (E2E-QP) on top of a Block-AP checkpoint.
+- `eval_quantized_model.py`
+  A convenience script in this repo that rebuilds a quantized model from a checkpoint directory plus quant config, then runs WikiText2 PPL and/or sample generation.
+
+Recommended environment setup for Hugging Face access on the current codebase:
+
+```bash
+source /etc/network_turbo
+export HF_HUB_DISABLE_XET=1
+```
+
+## Common Workflows
+
+### 1. Block-AP quantization
+
+Example: Llama-3.2-3B-Instruct, `int2 + group_size=32`, skipping `embedding` and `lm_head`.
+
+```bash
+cd /root/autodl-tmp/EfficientQAT
+source /etc/network_turbo
+export HF_HUB_DISABLE_XET=1
+export CUDA_VISIBLE_DEVICES=0
+
+python main_block_ap.py \
+  --model /root/autodl-tmp/llama3.2-3B-instruct \
+  --net llama3.2-3B-instruct \
+  --cache_dir /root/autodl-tmp/EfficientQAT/cache \
+  --output_dir /root/autodl-tmp/EfficientQAT/output/run_log_llama32_3b_w2g32 \
+  --save_quant_dir /root/autodl-tmp/EfficientQAT/output/run_model_llama32_3b_w2g32 \
+  --real_quant \
+  --wbits 2 \
+  --group_size 32 \
+  --quant_config /root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_skip_embed_head.json \
+  --calib_dataset wikitext2 \
+  --train_size 1024 \
+  --val_size 64 \
+  --training_seqlen 2048 \
+  --batch_size 1 \
+  --epochs 2 \
+  --quant_lr 1e-4 \
+  --weight_lr 2e-5 \
+  --min_lr_factor 20
+```
+
+Useful knobs:
+
+- `--wbits`
+  Weight bitwidth.
+- `--group_size`
+  Weight grouping size for per-group quantization.
+- `--quant_config`
+  JSON file for mixed precision / skip rules / per-layer overrides.
+- `--calib_dataset`
+  Calibration/training data source for Block-AP. Common choices in this repo are `wikitext2`, `c4`, and `redpajama`.
+- `--train_size`, `--training_seqlen`, `--epochs`
+  Main scaling knobs for quality vs. resource use.
+- `--off_load_to_disk`
+  Reduces RAM usage by spilling block caches to disk. Useful when large `train_size x seqlen` settings otherwise get killed by the OOM killer.
+
+### 2. Evaluate a quantized checkpoint on WikiText2 PPL
+
+Use the helper script added in this repo:
+
+```bash
+cd /root/autodl-tmp/EfficientQAT
+
+python eval_quantized_model.py \
+  --model /root/autodl-tmp/EfficientQAT/output/run_model_llama32_3b_w2g32 \
+  --base_model_path /root/autodl-tmp/llama3.2-3B-instruct \
+  --quant_config /root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_skip_embed_head.json \
+  --wbits 2 \
+  --group_size 32 \
+  --eval_ppl
+```
+
+If you also want a few deterministic sample generations:
+
+```bash
+python eval_quantized_model.py \
+  --model /root/autodl-tmp/EfficientQAT/output/run_model_llama32_3b_w2g32 \
+  --base_model_path /root/autodl-tmp/llama3.2-3B-instruct \
+  --quant_config /root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_skip_embed_head.json \
+  --wbits 2 \
+  --group_size 32 \
+  --eval_ppl \
+  --generate
+```
+
+The evaluation script supports:
+
+- Single-file `model.safetensors` checkpoints
+- Sharded checkpoints
+- Tokenizer/embedding size mismatches introduced by later E2E-QP runs
+- Per-layer mixed-precision configs via `--quant_config`
+
+### 3. E2E-QP on top of a Block-AP checkpoint
+
+Example: continue training quantization parameters on top of a Block-AP result.
+
+```bash
+cd /root/autodl-tmp/EfficientQAT
+source /etc/network_turbo
+export HF_HUB_DISABLE_XET=1
+export CUDA_VISIBLE_DEVICES=0
+
+python main_e2e_qp.py \
+  --quant_model_path /root/autodl-tmp/EfficientQAT/output/run_model_llama32_3b_w2g32 \
+  --base_model_path /root/autodl-tmp/llama3.2-3B-instruct \
+  --model_family llama3.2-3B-instruct \
+  --quant_config /root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_skip_embed_head.json \
+  --wbits 2 \
+  --group_size 32 \
+  --learning_rate 2e-5 \
+  --dataset alpaca \
+  --dataset_format alpaca \
+  --output_dir /root/autodl-tmp/EfficientQAT/output/e2e_qp_run_llama32_3b_w2g32_alpaca \
+  --do_train True \
+  --do_eval False \
+  --source_max_len 384 \
+  --target_max_len 128 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 1 \
+  --logging_steps 10 \
+  --save_strategy steps \
+  --save_steps 250 \
+  --save_total_limit 2 \
+  --evaluation_strategy no \
+  --max_steps 500 \
+  --bf16 \
+  --optim adamw_torch \
+  --group_by_length
+```
+
+Important notes for `main_e2e_qp.py` on this codebase:
+
+- Prefer passing `--base_model_path`
+  This speeds up quantized checkpoint restoration by loading untouched fp16 weights from the original model directory.
+- If you want epoch-based training, explicitly pass `--max_steps -1`
+  On the current toolchain, leaving `max_steps=0` can result in an immediate stop after one optimizer step in some setups.
+- For instruction models, `alpaca` / `deita-*` are the easiest E2E-QP datasets to get running.
+- If your target metric is WikiText2 PPL, instruction-style E2E-QP data may not help and can even hurt PPL. For PPL-focused runs, prefer pretraining-style data (`pt` format).
+
+### 4. Mixed precision quantization through JSON config
+
+The repo supports mixed precision and skip rules via `--quant_config`.
+
+Example: keep most layers at `int2 g32`, but quantize all `fc2`/`mlp.down_proj` layers as `int4 per-channel`:
+
+```json
+{
+  "default": {
+    "bits": 2,
+    "group_size": 32,
+    "mapping": "asymmetric",
+    "granularity": "per_group"
+  },
+  "overrides": [
+    {
+      "pattern": "mlp.down_proj",
+      "bits": 4,
+      "granularity": "per_channel",
+      "mapping": "asymmetric"
+    },
+    {
+      "pattern": "model.embed_tokens",
+      "enabled": false,
+      "bits": 16
+    },
+    {
+      "pattern": "lm_head",
+      "enabled": false,
+      "bits": 16
+    }
+  ]
+}
+```
+
+In Llama-style models:
+
+- `fc2` corresponds to `mlp.down_proj`
+- `fc1`-like expansion paths correspond to `mlp.gate_proj` and `mlp.up_proj`
+
+The current codebase now resolves config patterns against full module paths such as:
+
+- `model.layers.27.self_attn.v_proj`
+- `model.layers.26.mlp.down_proj`
+
+So you can target exact sensitive layers instead of only module-local names.
+
+### 5. Record per-layer gradient sensitivity during Block-AP
+
+To estimate which layers are the most sensitive, enable gradient logging during Block-AP:
+
+```bash
+python main_block_ap.py \
+  ... \
+  --log_grad_sensitivity \
+  --grad_sensitivity_topk 40 \
+  --grad_sensitivity_sort_by avg_mean_abs_grad
+```
+
+This writes:
+
+- `gradient_sensitivity_ranking.json`
+  Full ranking of quantized linear layers
+- top-k lines into the main log file
+
+Typical output layer names:
+
+- `layers.27.self_attn.v_proj`
+- `layers.27.self_attn.o_proj`
+- `layers.26.mlp.down_proj`
+
+This is useful for building mixed-precision configs where the most sensitive layers get promoted to `int4`.
+
+### 6. Common local config files added in this repo
+
+Some example configs already present locally:
+
+- [configs/llama32_3b_instruct_w2g32_skip_embed_head.json](/root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_skip_embed_head.json)
+- [configs/llama32_3b_instruct_w4g32_skip_embed_head.json](/root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w4g32_skip_embed_head.json)
+- [configs/llama32_3b_instruct_w2g32_fc2_w4pc_skip_embed_head.json](/root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_fc2_w4pc_skip_embed_head.json)
+- [configs/llama32_3b_instruct_w2g32_skip_fc2_embed_head.json](/root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_skip_fc2_embed_head.json)
+- [configs/llama32_3b_instruct_w2g32_top40sens_w4g32_skip_embed_head.json](/root/autodl-tmp/EfficientQAT/configs/llama32_3b_instruct_w2g32_top40sens_w4g32_skip_embed_head.json)
+- [configs/llama3_8b_instruct_w2g32_skip_embed_head.json](/root/autodl-tmp/EfficientQAT/configs/llama3_8b_instruct_w2g32_skip_embed_head.json)
+
 
 ## Model Zoo
 

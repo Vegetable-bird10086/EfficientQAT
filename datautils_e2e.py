@@ -127,21 +127,32 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                 )
             return dataset
         elif dataset_name == 'redpajama':
+            local_dataset = None
             try:
-                loacal_dataset = "/cpfs01/user/chenmengzhao/huggingface/datasets/togethercomputer___red_pajama-data-1_t-sample"
-                dataset = load_dataset(loacal_dataset)
+                local_dataset = "/cpfs01/user/chenmengzhao/huggingface/datasets/togethercomputer___red_pajama-data-1_t-sample"
+                dataset = load_dataset(local_dataset)
             except:
                 dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")   
             if "validation" not in dataset.keys():
                 validation_split = args.eval_dataset_size
-                dataset["validation"] = load_dataset(
-                    loacal_dataset,
-                    split=f"train[:{validation_split}]",
-                )
-                dataset["train"] = load_dataset(
-                    loacal_dataset,
-                    split=f"train[{validation_split}:]",
-                )
+                if local_dataset is not None and os.path.exists(local_dataset):
+                    dataset["validation"] = load_dataset(
+                        local_dataset,
+                        split=f"train[:{validation_split}]",
+                    )
+                    dataset["train"] = load_dataset(
+                        local_dataset,
+                        split=f"train[{validation_split}:]",
+                    )
+                else:
+                    dataset["validation"] = load_dataset(
+                        "togethercomputer/RedPajama-Data-1T-Sample",
+                        split=f"train[:{validation_split}]",
+                    )
+                    dataset["train"] = load_dataset(
+                        "togethercomputer/RedPajama-Data-1T-Sample",
+                        split=f"train[{validation_split}:]",
+                    )
             return dataset  
         else:
             raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")

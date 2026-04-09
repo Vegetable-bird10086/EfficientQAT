@@ -19,15 +19,149 @@ from datautils_block import BlockTrainDataset
 from torch.utils.data import DataLoader
 import shutil
 import os
+import json
 
-def update_dataset(layer, dataset, dev, attention_mask, position_ids):
+
+def _module_grad_statistics(module: nn.Module) -> dict | None:
+    total_sq = 0.0
+    total_abs = 0.0
+    total_elems = 0
+    max_abs = 0.0
+    grad_tensors = 0
+    trainable_param_names = []
+
+    for name, param in module.named_parameters():
+        if not param.requires_grad or param.grad is None:
+            continue
+        grad = param.grad.detach().float()
+        total_sq += float(grad.pow(2).sum().item())
+        total_abs += float(grad.abs().sum().item())
+        total_elems += grad.numel()
+        max_abs = max(max_abs, float(grad.abs().max().item()))
+        grad_tensors += 1
+        trainable_param_names.append(name)
+
+    if total_elems == 0:
+        return None
+
+    return {
+        "l2_norm": math.sqrt(total_sq),
+        "mean_abs_grad": total_abs / total_elems,
+        "max_abs_grad": max_abs,
+        "grad_tensors": grad_tensors,
+        "trainable_param_names": trainable_param_names,
+    }
+
+
+class GradientSensitivityTracker:
+    def __init__(self, sort_by: str = "avg_mean_abs_grad"):
+        self.sort_by = sort_by
+        self._stats: dict[str, dict] = {}
+
+    def update(self, block_index: int, model: nn.Module) -> None:
+        for name, module in model.named_modules():
+            if not isinstance(module, int_linear_fake.QuantLinear):
+                continue
+            grad_stats = _module_grad_statistics(module)
+            if grad_stats is None:
+                continue
+            module_name = f"layers.{block_index}.{name}"
+            entry = self._stats.setdefault(
+                module_name,
+                {
+                    "module_name": module_name,
+                    "updates": 0,
+                    "sum_l2_norm": 0.0,
+                    "sum_mean_abs_grad": 0.0,
+                    "max_abs_grad": 0.0,
+                    "grad_tensors": grad_stats["grad_tensors"],
+                    "trainable_param_names": grad_stats["trainable_param_names"],
+                },
+            )
+            entry["updates"] += 1
+            entry["sum_l2_norm"] += grad_stats["l2_norm"]
+            entry["sum_mean_abs_grad"] += grad_stats["mean_abs_grad"]
+            entry["max_abs_grad"] = max(entry["max_abs_grad"], grad_stats["max_abs_grad"])
+
+    def ranked(self) -> list[dict]:
+        ranked = []
+        for entry in self._stats.values():
+            updates = max(1, entry["updates"])
+            ranked.append(
+                {
+                    "module_name": entry["module_name"],
+                    "updates": entry["updates"],
+                    "avg_l2_norm": entry["sum_l2_norm"] / updates,
+                    "avg_mean_abs_grad": entry["sum_mean_abs_grad"] / updates,
+                    "max_abs_grad": entry["max_abs_grad"],
+                    "grad_tensors": entry["grad_tensors"],
+                    "trainable_param_names": entry["trainable_param_names"],
+                }
+            )
+        ranked.sort(key=lambda item: item[self.sort_by], reverse=True)
+        return ranked
+
+    def save(self, output_dir: str) -> str:
+        report_path = os.path.join(output_dir, "gradient_sensitivity_ranking.json")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(self.ranked(), handle, indent=2)
+        return report_path
+
+
+def _layer_hidden_states(output):
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    return output
+
+
+def _layer_forward(
+    layer,
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+    cache_position=None,
+    rotary_emb=None,
+    position_embeddings=None,
+):
+    forward_kwargs = {}
+    if attention_mask is not None:
+        forward_kwargs["attention_mask"] = attention_mask
+    if position_ids is not None:
+        forward_kwargs["position_ids"] = position_ids
+    if cache_position is not None:
+        forward_kwargs["cache_position"] = cache_position
+    if position_embeddings is not None:
+        forward_kwargs["position_embeddings"] = position_embeddings
+    elif rotary_emb is not None and position_ids is not None:
+        forward_kwargs["position_embeddings"] = rotary_emb(hidden_states, position_ids.to(hidden_states.device))
+    return _layer_hidden_states(layer(hidden_states, **forward_kwargs))
+
+
+def update_dataset(
+    layer,
+    dataset,
+    dev,
+    attention_mask,
+    position_ids,
+    cache_position=None,
+    rotary_emb=None,
+    position_embeddings=None,
+):
     with torch.no_grad():
         with torch.cuda.amp.autocast():
             for index, inps in enumerate(dataset):
                 inps = inps.to(dev)
                 if len(inps.shape)==2:
                     inps = inps.unsqueeze(0)
-                new_data = layer(inps, attention_mask=attention_mask,position_ids=position_ids)[0].to('cpu')
+                new_data = _layer_forward(
+                    layer,
+                    inps,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    rotary_emb=rotary_emb,
+                    position_embeddings=position_embeddings,
+                ).to('cpu')
                 dataset.update_data(index,new_data)
 
                     
@@ -42,6 +176,7 @@ def block_ap(
     logger.info("Starting ...")
     if args.off_load_to_disk:
         logger.info("offload the training dataset to disk, saving CPU memory, but may slowdown the training due to additional I/O...")
+    grad_tracker = GradientSensitivityTracker(sort_by=args.grad_sensitivity_sort_by) if getattr(args, "log_grad_sensitivity", False) else None
     
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cache = model.config.use_cache
@@ -86,14 +221,20 @@ def block_ap(
             self.index = 0
             self.attention_mask = None
             self.position_ids = None
+            self.cache_position = None
+            self.position_embeddings = None
 
         def forward(self, inp, **kwargs):
             self.dataset.update_data(self.index, inp.squeeze(0).to('cpu'))
             self.index += 1
             if self.attention_mask is None:
-                self.attention_mask = kwargs["attention_mask"]
+                self.attention_mask = kwargs.get("attention_mask")
             if self.position_ids is None:
-                self.position_ids = kwargs["position_ids"]
+                self.position_ids = kwargs.get("position_ids")
+            if self.cache_position is None:
+                self.cache_position = kwargs.get("cache_position")
+            if self.position_embeddings is None:
+                self.position_embeddings = kwargs.get("position_embeddings")
             raise ValueError
     
     # step 3.1: catch the input of training set
@@ -120,9 +261,14 @@ def block_ap(
                 pass
     attention_mask = layers[0].attention_mask
     position_ids = layers[0].position_ids
+    cache_position = layers[0].cache_position
+    position_embeddings = layers[0].position_embeddings
     layers[0] = layers[0].module
     if attention_mask is not None:
-        attention_mask_batch = attention_mask.repeat(args.batch_size,1,1,1).float()
+        if attention_mask.shape[0] == 1 and args.batch_size > 1:
+            attention_mask_batch = attention_mask.repeat(args.batch_size,1,1,1).float()
+        else:
+            attention_mask_batch = attention_mask.float()
     else:
         logger.info(
             "No attention mask caught from the first layer."
@@ -164,10 +310,14 @@ def block_ap(
         logger.info(f"=== Start quantize blocks {block_index}===")
         # step 6.1: replace torch.nn.Linear with QuantLinear for QAT
         layer = layers[block_index].to(dev)
+        block_rotary_emb = getattr(model.model, "rotary_emb", None)
+        if block_rotary_emb is not None:
+            block_rotary_emb = block_rotary_emb.to(dev)
         qlayer = copy.deepcopy(layer)
         for name, module in qlayer.named_modules():
             if isinstance(module,torch.nn.Linear):
-                spec = quant_config.resolve(name, module.in_features) if quant_config is not None else QuantizationSpec(bits=args.wbits, group_size=args.group_size)
+                resolved_name = f"model.layers.{block_index}.{name}"
+                spec = quant_config.resolve(resolved_name, module.in_features) if quant_config is not None else QuantizationSpec(bits=args.wbits, group_size=args.group_size)
                 if not spec.should_quantize:
                     continue
                 quantlinear = int_linear_fake.QuantLinear(module, args.wbits, args.group_size, quant_spec=spec)
@@ -179,8 +329,8 @@ def block_ap(
         # step 6.2: obtain output of full-precision model for MSE
         set_quant_state(qlayer,weight_quant=False) # deactivate quantization for obtaining ground truth
         if args.epochs > 0:
-            update_dataset(qlayer,fp_train_inps,dev,attention_mask,position_ids)
-            update_dataset(qlayer,fp_val_inps,dev,attention_mask,position_ids)
+            update_dataset(qlayer,fp_train_inps,dev,attention_mask,position_ids,cache_position=cache_position,rotary_emb=block_rotary_emb,position_embeddings=position_embeddings)
+            update_dataset(qlayer,fp_val_inps,dev,attention_mask,position_ids,cache_position=cache_position,rotary_emb=block_rotary_emb,position_embeddings=position_embeddings)
         set_quant_state(qlayer,weight_quant=True)  # activate quantization
         
         
@@ -228,7 +378,15 @@ def block_ap(
                     with torch.cuda.amp.autocast():
                         input = quant_inps.to(dev)
                         label = fp_inps.to(dev)
-                        quant_out = qlayer(input, attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                        quant_out = _layer_forward(
+                            qlayer,
+                            input,
+                            attention_mask=attention_mask_batch,
+                            position_ids=position_ids,
+                            cache_position=cache_position,
+                            rotary_emb=block_rotary_emb,
+                            position_embeddings=position_embeddings,
+                        )
                         reconstruction_loss = loss_func(label, quant_out)
                         loss =  reconstruction_loss
 
@@ -238,6 +396,8 @@ def block_ap(
                     loss_list.append(reconstruction_loss.detach().cpu())
                     optimizer.zero_grad()
                     norm = loss_scaler(loss, optimizer,parameters=trainable_parameters(qlayer)).cpu()
+                    if grad_tracker is not None:
+                        grad_tracker.update(block_index, qlayer)
                     norm_list.append(norm.data)
 
                     # adjust lr
@@ -256,7 +416,15 @@ def block_ap(
                         with torch.cuda.amp.autocast():
                             input = quant_inps.to(dev)
                             label = fp_inps.to(dev)
-                            quant_out = qlayer(input, attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                            quant_out = _layer_forward(
+                                qlayer,
+                                input,
+                                attention_mask=attention_mask_batch,
+                                position_ids=position_ids,
+                                cache_position=cache_position,
+                                rotary_emb=block_rotary_emb,
+                                position_embeddings=position_embeddings,
+                            )
                             reconstruction_loss = loss_func(label, quant_out)
                     val_loss_list.append(reconstruction_loss.cpu())
                  
@@ -281,9 +449,11 @@ def block_ap(
 
         # step 6.7: update inputs of quantization model
         if args.epochs>0:
-            update_dataset(qlayer,quant_train_inps,dev,attention_mask,position_ids)
-            update_dataset(qlayer,quant_val_inps,dev,attention_mask,position_ids)
+            update_dataset(qlayer,quant_train_inps,dev,attention_mask,position_ids,cache_position=cache_position,rotary_emb=block_rotary_emb,position_embeddings=position_embeddings)
+            update_dataset(qlayer,quant_val_inps,dev,attention_mask,position_ids,cache_position=cache_position,rotary_emb=block_rotary_emb,position_embeddings=position_embeddings)
         layers[block_index] = qlayer.to("cpu")
+        if block_rotary_emb is not None:
+            model.model.rotary_emb = block_rotary_emb.cpu()
 
         # step 7: pack quantized weights into low-bits format, note that this process is slow on poor CPU or busy CPU
         if args.real_quant:
@@ -312,6 +482,26 @@ def block_ap(
                 del module        
         del layer
         torch.cuda.empty_cache()
+
+    if grad_tracker is not None and args.output_dir:
+        ranked = grad_tracker.ranked()
+        logger.info(
+            "=== Gradient sensitivity ranking (sorted by %s, top %d) ===",
+            args.grad_sensitivity_sort_by,
+            min(args.grad_sensitivity_topk, len(ranked)),
+        )
+        for index, item in enumerate(ranked[: args.grad_sensitivity_topk], start=1):
+            logger.info(
+                "[%d] %s avg_mean_abs_grad=%.8e avg_l2_norm=%.8e max_abs_grad=%.8e updates=%d",
+                index,
+                item["module_name"],
+                item["avg_mean_abs_grad"],
+                item["avg_l2_norm"],
+                item["max_abs_grad"],
+                item["updates"],
+            )
+        report_path = grad_tracker.save(args.output_dir)
+        logger.info("saved gradient sensitivity report to %s", report_path)
 
     # delete cached dataset
     if args.off_load_to_disk:

@@ -1,0 +1,26 @@
+{
+  "default": {
+    "bits": 2,
+    "group_size": 32,
+    "mapping": "asymmetric",
+    "granularity": "per_group"
+  },
+  "overrides": [
+    {
+      "pattern": "mlp.down_proj",
+      "bits": 4,
+      "granularity": "per_channel",
+      "mapping": "asymmetric"
+    },
+    {
+      "pattern": "model.embed_tokens",
+      "enabled": false,
+      "bits": 16
+    },
+    {
+      "pattern": "lm_head",
+      "enabled": false,
+      "bits": 16
+    }
+  ]
+}

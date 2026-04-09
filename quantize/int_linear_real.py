@@ -1,13 +1,17 @@
 import math
 from logging import getLogger
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import transformers
-from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_in_model
+from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_and_dispatch
+from safetensors.torch import load_file as load_safetensors_file
 from tqdm import tqdm
+from transformers.modeling_utils import load_sharded_checkpoint
 
 from hf_compat import build_model_from_config, load_auto_config, load_auto_tokenizer
+from hf_compat import load_auto_model_for_causal_lm
 from quantize.bitpacking import pack_cols, pack_rows, pad_rows, unpack_cols, unpack_rows, unpad_rows
 from quantize.config import QuantizationSpec, maybe_load_quant_config
 from quantize.quantizer import CLIPMIN, clamp_ste, round_ste
@@ -158,7 +162,12 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         self.qweight = pack_rows(intweight.to(torch.int64), self.bits).to(torch.int32)
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
-        self.qzeros = self._pack_zero_points(self.zero_points.detach()).to(self.qzeros.device)
+        zero_points = self.zero_points.detach()
+        if zero_points.device.type != "meta":
+            target_device = self.qzeros.device
+            if target_device.type == "meta":
+                target_device = zero_points.device
+            self.qzeros = self._pack_zero_points(zero_points).to(target_device)
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination.pop(prefix + "zero_points", None)
         destination[prefix + "qzeros"] = self.qzeros if keep_vars else self.qzeros.detach()
@@ -206,6 +215,7 @@ def load_quantized_model(
     wbits,
     group_size,
     quant_config_path=None,
+    base_model_path=None,
     trust_remote_code=False,
     token=None,
 ):
@@ -222,41 +232,83 @@ def load_quantized_model(
     if quant_config_path is not None:
         quant_config = maybe_load_quant_config(quant_config_path, default_bits=wbits, default_group_size=group_size)
 
-    with init_empty_weights():
-        model = build_model_from_config(
-            config=config,
-            torch_dtype=torch.float16,
-            trust_remote_code=trust_remote_code,
-        )
+    def _prepare_quantized_modules(target_model):
+        layers = target_model.model.layers
+        for index in tqdm(range(len(layers))):
+            layer = layers[index]
+            named_linears = get_named_linears(layer, torch.nn.Linear)
+            for name, module in named_linears.items():
+                resolved_name = f"model.layers.{index}.{name}"
+                spec = quant_config.resolve(resolved_name, module.in_features)
+                if not spec.should_quantize:
+                    continue
+                q_linear = QuantLinear(
+                    spec.bits,
+                    spec.resolved_group_size(module.in_features),
+                    module.in_features,
+                    module.out_features,
+                    not module.bias is None,
+                    mapping=spec.mapping,
+                    train_scale=spec.train_scale,
+                    train_zero_point=spec.train_zero_point,
+                    quant_spec=spec,
+                )
+                try:
+                    q_linear.to(next(layer.parameters()).device)
+                except StopIteration:
+                    pass
+                set_op_by_name(layer, name, q_linear)
+        target_model.tie_weights()
+        return target_model
 
-    layers = model.model.layers
-    for index in tqdm(range(len(layers))):
-        layer = layers[index]
-        named_linears = get_named_linears(layer, torch.nn.Linear)
-        for name, module in named_linears.items():
-            spec = quant_config.resolve(name, module.in_features)
-            if not spec.should_quantize:
-                continue
-            q_linear = QuantLinear(
-                spec.bits,
-                spec.resolved_group_size(module.in_features),
-                module.in_features,
-                module.out_features,
-                not module.bias is None,
-                mapping=spec.mapping,
-                train_scale=spec.train_scale,
-                train_zero_point=spec.train_zero_point,
-                quant_spec=spec,
+    try:
+        with init_empty_weights():
+            model = build_model_from_config(
+                config=config,
+                torch_dtype=torch.float16,
+                trust_remote_code=trust_remote_code,
             )
-            q_linear.to(next(layer.parameters()).device)
-            set_op_by_name(layer, name, q_linear)
+        model = _prepare_quantized_modules(model)
+        device_map = infer_auto_device_map(model)
+        print("Loading pre-computed quantized weights...")
+        model = load_checkpoint_and_dispatch(
+            model,
+            checkpoint=model_path,
+            device_map=device_map,
+            offload_state_dict=True,
+        )
+    except Exception as exc:
+        logger.warning("Meta-device quantized load failed, falling back to direct CPU load: %s", exc)
+        if base_model_path is not None:
+            model = load_auto_model_for_causal_lm(
+                base_model_path,
+                device_map='cpu',
+                torch_dtype=torch.float16,
+                trust_remote_code=trust_remote_code,
+                token=token,
+            )
+        else:
+            model = build_model_from_config(
+                config=config,
+                torch_dtype=torch.float16,
+                trust_remote_code=trust_remote_code,
+            )
+        model = _prepare_quantized_modules(model)
+        print("Loading pre-computed quantized weights on CPU...")
+        safetensors_path = Path(model_path) / "model.safetensors"
+        if safetensors_path.exists():
+            state_dict = load_safetensors_file(str(safetensors_path))
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if unexpected:
+                raise RuntimeError(f"Unexpected keys while loading quantized checkpoint: {unexpected}")
+            allowed_missing = {"lm_head.weight"}
+            unexpected_missing = [key for key in missing if key not in allowed_missing]
+            if unexpected_missing:
+                raise RuntimeError(f"Missing required keys while loading quantized checkpoint: {unexpected_missing}")
+        else:
+            load_sharded_checkpoint(model, model_path, strict=True, prefer_safe=True)
 
-    model.tie_weights()
-    device_map = infer_auto_device_map(model)
-    print("Loading pre-computed quantized weights...")
-    load_checkpoint_in_model(model, checkpoint=model_path, device_map=device_map, offload_state_dict=True)
     print("Loading pre-computed quantized weights Successfully")
-
     return model, tokenizer
 
 
