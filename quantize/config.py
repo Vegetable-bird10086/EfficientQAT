@@ -30,7 +30,7 @@ class QuantizationSpec:
     granularity: str = "per_group"
     enabled: bool = True
     train_scale: bool = True
-    train_zero_point: bool = True
+    train_zero_point: bool = False
 
     def __post_init__(self) -> None:
         self.mapping = _normalize_mapping(self.mapping)

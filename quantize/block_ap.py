@@ -225,7 +225,7 @@ def block_ap(
             self.position_embeddings = None
 
         def forward(self, inp, **kwargs):
-            self.dataset.update_data(self.index, inp.squeeze(0).to('cpu'))
+            self.dataset.update_data(self.index, inp.to('cpu'))
             self.index += 1
             if self.attention_mask is None:
                 self.attention_mask = kwargs.get("attention_mask")
@@ -378,6 +378,10 @@ def block_ap(
                     with torch.cuda.amp.autocast():
                         input = quant_inps.to(dev)
                         label = fp_inps.to(dev)
+                        if input.dim() == 2:
+                            input = input.unsqueeze(0)
+                        if label.dim() == 2:
+                            label = label.unsqueeze(0)
                         quant_out = _layer_forward(
                             qlayer,
                             input,
@@ -416,6 +420,10 @@ def block_ap(
                         with torch.cuda.amp.autocast():
                             input = quant_inps.to(dev)
                             label = fp_inps.to(dev)
+                            if input.dim() == 2:
+                                input = input.unsqueeze(0)
+                            if label.dim() == 2:
+                                label = label.unsqueeze(0)
                             quant_out = _layer_forward(
                                 qlayer,
                                 input,

@@ -26,7 +26,7 @@ from hf_compat import tokenizer_is_llama_like
 from hf_compat import resolve_hf_token
 from quantize.int_linear_real import load_quantized_model,QuantLinear
 from quantize.utils import is_quant_parameter_name
-from quantize.config import maybe_load_quant_config
+from quantize.config import load_quant_config, maybe_load_quant_config
 from pathlib import Path
 
 try:
