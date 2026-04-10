@@ -17,7 +17,7 @@ from hf_compat import (
     load_auto_tokenizer,
     resolve_hf_token,
 )
-from quantize.config import maybe_load_quant_config
+from quantize.config import load_quant_config, maybe_load_quant_config
 from quantize.int_linear_real import QuantLinear
 from quantize.utils import get_named_linears, set_op_by_name
 
@@ -36,6 +36,18 @@ DEFAULT_PROMPTS = [
     "请用中文简要解释什么是梯度下降。",
     "Write a Python function that returns the nth Fibonacci number.",
 ]
+
+
+def resolve_quant_config(explicit_path: str | None, fallback_model_dir: str, wbits: int, group_size: int):
+    if explicit_path:
+        config_path = Path(explicit_path)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Explicit quantization config not found: {config_path}. "
+                "If you intended to pass an absolute path, make sure it starts with '/'."
+            )
+        return load_quant_config(str(config_path), default_bits=wbits, default_group_size=group_size)
+    return maybe_load_quant_config(fallback_model_dir, default_bits=wbits, default_group_size=group_size)
 
 
 def parse_args():
@@ -137,7 +149,7 @@ def build_quantized_model(
         )
         model.resize_token_embeddings(len(tokenizer))
 
-    quant_config = maybe_load_quant_config(quant_config_path or model_path, default_bits=wbits, default_group_size=group_size)
+    quant_config = resolve_quant_config(quant_config_path, model_path, wbits=wbits, group_size=group_size)
     replaced = 0
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise ValueError("This helper currently expects decoder-only models with model.model.layers.")

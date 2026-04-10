@@ -4,7 +4,7 @@ from gptqmodel import GPTQModel, QuantizeConfig, get_backend
 from pathlib import Path
 import time
 from hf_compat import load_auto_tokenizer, resolve_hf_token
-from quantize.config import maybe_load_quant_config, is_uniform_quant_config
+from quantize.config import load_quant_config, maybe_load_quant_config, is_uniform_quant_config
 
 def main():
     import argparse
@@ -26,7 +26,16 @@ def main():
 
     args = parser.parse_args()
     hf_token = resolve_hf_token(token=args.token)
-    quant_config = maybe_load_quant_config(args.quant_config or args.model, default_bits=args.wbits, default_group_size=args.group_size)
+    if args.quant_config is not None:
+        config_path = Path(args.quant_config)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Explicit quantization config not found: {config_path}. "
+                "If you intended to pass an absolute path, make sure it starts with '/'."
+            )
+        quant_config = load_quant_config(str(config_path), default_bits=args.wbits, default_group_size=args.group_size)
+    else:
+        quant_config = maybe_load_quant_config(args.model, default_bits=args.wbits, default_group_size=args.group_size)
     if not is_uniform_quant_config(quant_config):
         raise NotImplementedError(
             "GPTQ/BitBLAS export currently expects a uniform quantization config. "

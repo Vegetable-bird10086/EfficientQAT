@@ -5,7 +5,7 @@ import torch
 from accelerate import init_empty_weights
 
 from hf_compat import build_model_from_config, load_auto_config, resolve_hf_token
-from quantize.config import maybe_load_quant_config
+from quantize.config import load_quant_config, maybe_load_quant_config
 from quantize.torchao_adapter import build_torchao_manifest_entry
 from quantize.utils import get_named_linears
 
@@ -24,7 +24,16 @@ def main():
     args = parser.parse_args()
 
     hf_token = resolve_hf_token(token=args.token)
-    quant_config = maybe_load_quant_config(args.quant_config or args.model, default_bits=args.wbits, default_group_size=args.group_size)
+    if args.quant_config is not None:
+        config_path = Path(args.quant_config)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Explicit quantization config not found: {config_path}. "
+                "If you intended to pass an absolute path, make sure it starts with '/'."
+            )
+        quant_config = load_quant_config(str(config_path), default_bits=args.wbits, default_group_size=args.group_size)
+    else:
+        quant_config = maybe_load_quant_config(args.model, default_bits=args.wbits, default_group_size=args.group_size)
     config = load_auto_config(args.model, trust_remote_code=args.trust_remote_code, token=hf_token)
     with init_empty_weights():
         model = build_model_from_config(config=config, trust_remote_code=args.trust_remote_code)

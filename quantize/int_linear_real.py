@@ -13,7 +13,7 @@ from transformers.modeling_utils import load_sharded_checkpoint
 from hf_compat import build_model_from_config, load_auto_config, load_auto_tokenizer
 from hf_compat import load_auto_model_for_causal_lm
 from quantize.bitpacking import pack_cols, pack_rows, pad_rows, unpack_cols, unpack_rows, unpad_rows
-from quantize.config import QuantizationSpec, maybe_load_quant_config
+from quantize.config import QuantizationSpec, load_quant_config, maybe_load_quant_config
 from quantize.quantizer import CLIPMIN, clamp_ste, round_ste
 from quantize.utils import get_named_linears, set_op_by_name
 
@@ -28,6 +28,18 @@ try:
     from quantize.triton_utils.kernels import dequant_dim0 as triton_dequant_dim0
 except Exception:
     triton_dequant_dim0 = None
+
+
+def resolve_quant_config(explicit_path, fallback_model_dir, wbits, group_size):
+    if explicit_path is not None:
+        config_path = Path(explicit_path)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Explicit quantization config not found: {config_path}. "
+                "If you intended to pass an absolute path, make sure it starts with '/'."
+            )
+        return load_quant_config(str(config_path), default_bits=wbits, default_group_size=group_size)
+    return maybe_load_quant_config(fallback_model_dir, default_bits=wbits, default_group_size=group_size)
 
 
 class TritonModuleMixin:
@@ -228,9 +240,7 @@ def load_quantized_model(
         token=token,
     )
     config = load_auto_config(model_path, trust_remote_code=trust_remote_code, token=token)
-    quant_config = maybe_load_quant_config(model_path, default_bits=wbits, default_group_size=group_size)
-    if quant_config_path is not None:
-        quant_config = maybe_load_quant_config(quant_config_path, default_bits=wbits, default_group_size=group_size)
+    quant_config = resolve_quant_config(quant_config_path, model_path, wbits=wbits, group_size=group_size)
 
     def _prepare_quantized_modules(target_model):
         layers = target_model.model.layers

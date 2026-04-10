@@ -435,7 +435,16 @@ def train():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     logger = utils.create_logger(args.output_dir)
     logger.info(args)
-    maybe_load_quant_config(args.quant_config or args.quant_model_path, default_bits=args.wbits, default_group_size=args.group_size).save(args.output_dir)
+    if args.quant_config is not None:
+        config_path = Path(args.quant_config)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Explicit quantization config not found: {config_path}. "
+                "If you intended to pass an absolute path, make sure it starts with '/'."
+            )
+        load_quant_config(str(config_path), default_bits=args.wbits, default_group_size=args.group_size).save(args.output_dir)
+    else:
+        maybe_load_quant_config(args.quant_model_path, default_bits=args.wbits, default_group_size=args.group_size).save(args.output_dir)
     
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
