@@ -1,0 +1,2 @@
+bitsandbytes>=0.48,<0.50
+triton>=3.2,<4
